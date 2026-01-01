@@ -8,8 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
 import re
-import easyocr
-from deep_translator import GoogleTranslator
+import base64
 from groq import Groq
 from side_function import (
     get_obj_json,
@@ -54,79 +53,94 @@ def options_analyze():
     return JSONResponse(status_code=204, content=None)
 
 
-# ===== OCR helpers (EasyOCR + Groq DeepSeek) =====
-def _extract_text_with_easyocr(filename: str) -> str:
-    reader = easyocr.Reader(["vi", "en"])  # CPU OK; lần đầu hơi chậm do load model
-    result = reader.readtext(filename)
-    text_in_frame = ""
-    for image_result in result:
-        if isinstance(image_result, (tuple, list)) and len(image_result) == 3:
-            _, text, _ = image_result
-            text_in_frame += " " + text
-    return text_in_frame.strip()
-
-
-def _translate_to_vi(text: str) -> str:
-    if not text:
-        return ""
-    translator = GoogleTranslator(source="auto", target="vi")
-    return translator.translate(text)
-
-
-def _build_deepseek_prompt_vi(text_vi: str) -> str:
-    return (
-        "Nhiệm vụ: Hiệu chỉnh văn bản tiếng Việt nhận từ OCR cho chính xác và tự nhiên.\n"
-        "Yêu cầu: Sửa lỗi nhận diện, bổ sung ký tự/từ còn thiếu dựa vào ngữ cảnh, giữ nguyên ý, không bịa thêm.\n"
-        "Định dạng: Chỉ xuất RA KẾT QUẢ CUỐI CÙNG, không giải thích.\n"
-        "Ràng buộc: chỉ được thực hiện nhiệm vụ không nói thêm bất kỳ thứ gì khác.\n\n"
-        f"Văn bản (VI): {text_vi}"
-    )
-
-
+# ===== OCR helpers (Groq Vision) =====
 def _init_groq() -> Groq:
+    """Initialize Groq client.
+
+    Returns:
+        Groq: Initialized Groq client instance.
+
+    Raises:
+        RuntimeError: If GROQ_API_KEY is missing from environment variables.
+    """
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("Thiếu GROQ_API_KEY trong biến môi trường")
     return Groq(api_key=api_key)
 
 
-def _strip_deepseek_reasoning(output_text: str) -> str:
-    if not output_text:
-        return ""
-    # Xóa các khối suy luận phổ biến
-    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", output_text, flags=re.IGNORECASE)
-    cleaned = re.sub(r"```\s*reasoning[\s\S]*?```", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(
-        r"^(?:\s*(?:Reasoning|Suy luận)\s*:\s*)+",
-        "",
-        cleaned,
-        flags=re.IGNORECASE | re.MULTILINE,
-    )
-    return cleaned.strip()
+def _encode_image_to_base64(filename: str) -> str:
+    """Encode image file to base64 string.
+
+    Args:
+        filename: Path to image file.
+
+    Returns:
+        str: Base64 encoded image string.
+    """
+    with open(filename, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode("utf-8")
 
 
-def _refine_text_with_groq_vi(text_vi: str) -> str:
-    client = _init_groq()
-    prompt = _build_deepseek_prompt_vi(text_vi)
-    completion = client.chat.completions.create(
-        model=os.getenv("GROQ_MODEL", "deepseek-r1-distill-llama-70b"),
-        temperature=0.2,
-        top_p=0.9,
-        max_tokens=512,
-        messages=[
-            {
-                "role": "system",
-                "content": "Bạn là bộ hiệu chỉnh văn bản OCR tiếng Việt. Chỉ trả về kết quả cuối.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-    )
-    raw = (
-        completion.choices[0].message.content
-        if completion and completion.choices
-        else ""
-    )
-    return _strip_deepseek_reasoning(raw)
+def _extract_text_with_groq_vision(filename: str) -> str:
+    """Extract text from image using Groq vision model directly.
+
+    Args:
+        filename: Path to image file.
+
+    Returns:
+        str: Extracted text from image.
+
+    Raises:
+        Exception: If OCR processing fails.
+    """
+    try:
+        client = _init_groq()
+        image_base64 = _encode_image_to_base64(filename)
+
+        # Determine image format from filename
+        image_format = "jpeg"
+        if filename.lower().endswith(".png"):
+            image_format = "png"
+        elif filename.lower().endswith(".jpg") or filename.lower().endswith(".jpeg"):
+            image_format = "jpeg"
+        elif filename.lower().endswith(".webp"):
+            image_format = "webp"
+
+        image_url = f"data:image/{image_format};base64,{image_base64}"
+
+        completion = client.chat.completions.create(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Hãy đọc và trích xuất tất cả văn bản có trong ảnh này. Chỉ trả về văn bản, không giải thích.",
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_url,
+                            },
+                        },
+                    ],
+                }
+            ],
+            model=os.getenv(
+                "GROQ_OCR_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"
+            ),
+        )
+
+        extracted_text = (
+            completion.choices[0].message.content.strip()
+            if completion and completion.choices
+            else ""
+        )
+
+        return extracted_text
+    except Exception as e:
+        raise Exception(f"Lỗi khi xử lý OCR với Groq: {e}")
 
 
 def _prettify_vi_sentence(text: str) -> str:
@@ -200,9 +214,93 @@ def _summarize_scene_with_groq_vi(caption_vi: str, counts: Dict[str, int]) -> st
             if completion and completion.choices
             else ""
         )
-        return _strip_deepseek_reasoning(content) or caption_vi
+        return content.strip() or caption_vi
     except Exception:
         return caption_vi
+
+
+def _translate_text_with_groq(text: str, target_lang: str) -> str:
+    """Translate text using Groq compound model.
+
+    Args:
+        text: Text to translate.
+        target_lang: Target language code ('en' or 'vi').
+
+    Returns:
+        str: Translated text, or original text if translation fails.
+    """
+    if not text or not text.strip():
+        return text
+
+    if target_lang not in ["en", "vi"]:
+        return text
+
+    try:
+        client = _init_groq()
+        target_language = "English" if target_lang == "en" else "Vietnamese"
+
+        completion = client.chat.completions.create(
+            model="groq/compound",
+            temperature=0.2,
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"You are a professional translator. Translate the given text to {target_language}. Only return the translated text, no explanations.",
+                },
+                {
+                    "role": "user",
+                    "content": f"Translate this text to {target_language}:\n{text}",
+                },
+            ],
+        )
+
+        translated = (
+            completion.choices[0].message.content.strip()
+            if completion and completion.choices
+            else ""
+        )
+
+        return translated if translated else text
+    except Exception:
+        return text
+
+
+def _format_response_text(text: str, language: Optional[str]) -> str:
+    """Format response text based on language preference.
+
+    Args:
+        text: Original text in Vietnamese.
+        language: Language code ('en' or 'vi'), or None for default (Vietnamese).
+
+    Returns:
+        str: Formatted text in requested language.
+    """
+    if not text:
+        return text
+
+    # Default to Vietnamese if language not specified or invalid
+    if not language or language.lower() not in ["en", "vi"]:
+        return _prettify_vi_sentence(text)
+
+    if language.lower() == "vi":
+        return _prettify_vi_sentence(text)
+    else:  # 'en'
+        # Translate to English
+        translated = _translate_text_with_groq(text, "en")
+        # Apply basic formatting (capitalize first letter, add period)
+        try:
+            s = (translated or "").strip()
+            if not s:
+                return s
+            first = s[0].upper()
+            s = first + s[1:]
+            if s[-1] not in ".!?…":
+                s = s + "."
+            s = re.sub(r"\s+", " ", s)
+            return s.strip()
+        except Exception:
+            return translated
 
 
 def _extract_find_target_with_groq(
@@ -250,19 +348,39 @@ def _extract_find_target_with_groq(
 
 
 def OCR(filename: str) -> str:
+    """Extract text from image using Groq vision model.
+
+    Args:
+        filename: Path to image file.
+
+    Returns:
+        str: Extracted and processed text, or error message if processing fails.
+    """
     try:
-        raw_text = _extract_text_with_easyocr(filename)
-        if not raw_text:
+        text = _extract_text_with_groq_vision(filename)
+        if not text:
             return "Đầu vào không thoả mãn. Vui lòng thử lại với ảnh có văn bản."
-        text_vi = _translate_to_vi(raw_text)
-        refined = _refine_text_with_groq_vi(text_vi)
-        return refined or text_vi or raw_text
+        return text
     except Exception as e:
         return f"Lỗi khi xử lý văn bản: {e}"
 
 
 @app.post("/analyze")
-async def analyze(file: UploadFile = File(...), prompt: Optional[str] = Form(None)):
+async def analyze(
+    file: UploadFile = File(...),
+    prompt: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
+):
+    """Analyze image with optional language parameter.
+
+    Args:
+        file: Uploaded image file.
+        prompt: User prompt/request.
+        language: Language code ('en' for English, 'vi' for Vietnamese). Defaults to 'vi'.
+
+    Returns:
+        dict: Analysis result with text in requested language.
+    """
     name = f"photo_{int(time.time())}.jpg"
     path = os.path.join(UPLOAD_FOLDER, name)
     with open(path, "wb") as f:
@@ -302,7 +420,7 @@ async def analyze(file: UploadFile = File(...), prompt: Optional[str] = Form(Non
                 "status": "success",
                 "intent": intent,
                 "file": name,
-                "text": _prettify_vi_sentence(smooth_text or ""),
+                "text": _format_response_text(smooth_text or "", language),
             }
 
         if intent == "count":
@@ -319,7 +437,7 @@ async def analyze(file: UploadFile = File(...), prompt: Optional[str] = Form(Non
                     "status": "success",
                     "intent": intent,
                     "file": name,
-                    "text": _prettify_vi_sentence(msg),
+                    "text": _format_response_text(msg, language),
                     "data": {"target": pretty_t, "count": c, "counts": counts},
                 }
             # không có target: tổng hợp lại với caption để trả câu mượt hơn
@@ -333,17 +451,18 @@ async def analyze(file: UploadFile = File(...), prompt: Optional[str] = Form(Non
                 "status": "success",
                 "intent": intent,
                 "file": name,
-                "text": _prettify_vi_sentence(summary),
+                "text": _format_response_text(summary, language),
                 "data": {"counts": counts},
             }
 
         if intent == "find":
             if not target:
+                clarify_text = "bạn muốn tìm gì"
                 return {
                     "status": "clarify",
                     "intent": intent,
                     "file": name,
-                    "text": "bạn muốn tìm gì",
+                    "text": _format_response_text(clarify_text, language),
                     "need_clarification": True,
                 }
             # Dùng CLIP để ước lượng có/không
@@ -356,7 +475,7 @@ async def analyze(file: UploadFile = File(...), prompt: Optional[str] = Form(Non
                 "status": "success",
                 "intent": intent,
                 "file": name,
-                "text": _prettify_vi_sentence(text),
+                "text": _format_response_text(text, language),
                 "data": {"target": pretty_t, "similarity": score},
             }
 
@@ -366,7 +485,7 @@ async def analyze(file: UploadFile = File(...), prompt: Optional[str] = Form(Non
                 "status": "success",
                 "intent": "ocr",
                 "file": name,
-                "text": _prettify_vi_sentence(text or ""),
+                "text": _format_response_text(text or "", language),
             }
 
         if intent == "history":
@@ -375,7 +494,7 @@ async def analyze(file: UploadFile = File(...), prompt: Optional[str] = Form(Non
                 "status": "success",
                 "intent": "history",
                 "file": name,
-                "text": _prettify_vi_sentence(answer or ""),
+                "text": _format_response_text(answer or "", language),
             }
 
         # Fallback: mô tả
@@ -395,23 +514,26 @@ async def analyze(file: UploadFile = File(...), prompt: Optional[str] = Form(Non
             "status": "success",
             "intent": "describe",
             "file": name,
-            "text": _prettify_vi_sentence(text or ""),
+            "text": _format_response_text(text or "", language),
         }
 
     except Exception as e:
+        error_text = f"Lỗi xử lý: {str(e)}"
         return {
             "status": "error",
             "intent": intent,
             "file": name,
-            "text": f"Lỗi xử lý: {str(e)}",
+            "text": _format_response_text(error_text, language),
         }
 
 
 @app.post("/analyze/")
 async def analyze_slash(
-    file: UploadFile = File(...), prompt: Optional[str] = Form(None)
+    file: UploadFile = File(...),
+    prompt: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
 ):
-    return await analyze(file, prompt)
+    return await analyze(file, prompt, language)
 
 
 # In routes để bạn đối chiếu khi start
@@ -457,7 +579,7 @@ def _classify_intent(prompt: str) -> Tuple[str, Optional[str], bool]:
         return "describe", None, True
 
     api_key = os.getenv("GROQ_API_KEY", "").strip()
-    model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+    model = os.getenv("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 
     def _keyword_fallback() -> Tuple[str, Optional[str], bool]:
         if any(k in p for k in ["dem", "bao nhieu", "how many", "count"]):
